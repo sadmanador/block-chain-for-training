@@ -16,8 +16,8 @@ async function seedDatabase() {
     await Block.deleteMany({});
     console.log('Cleared existing data');
 
-    // Reset local blockchain
-    await localBlockchain.resetChain();
+    // Reset local blockchain — initial balances are embedded in genesis block
+    await localBlockchain.resetChain({ alice: 1000, bob: 1000, admin: 0 });
     console.log('Reset local blockchain');
 
     // Create users

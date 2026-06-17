@@ -125,7 +125,30 @@ export async function GET() {
       (acc, block) => acc + block.transactionCount,
       0
     );
-    
+
+    // Balance tamper detection: compare DB balances against blockchain-derived expected balances
+    const expectedBalances = await localBlockchain.computeExpectedBalances();
+    const hasKnownBalances = Object.keys(expectedBalances).length > 0;
+    const balanceTampering: {
+      username: string;
+      dbBalance: number;
+      expectedBalance: number;
+      difference: number;
+    }[] = [];
+    if (hasKnownBalances) {
+      for (const user of users) {
+        const expected = expectedBalances[user.username];
+        if (expected !== undefined && expected !== user.balance) {
+          balanceTampering.push({
+            username: user.username,
+            dbBalance: user.balance,
+            expectedBalance: expected,
+            difference: user.balance - expected,
+          });
+        }
+      }
+    }
+
     // Get database info for display
     const mongoUri = process.env.MONGODB_URI || '';
     const dbUserMatch = mongoUri.match(/\/\/([^:]+):/);
@@ -138,10 +161,16 @@ export async function GET() {
         totalTransactions,
         tamperedTxCount,
         revertedTxCount,
-        users: users.map((u) => ({ username: u.username, balance: u.balance })),
+        users: users.map((u) => ({
+          username: u.username,
+          balance: u.balance,
+          expectedBalance: expectedBalances[u.username] ?? null,
+          balanceTampered: balanceTampering.some(b => b.username === u.username),
+        })),
         chainValid: validation.valid,
-        tamperingDetected: tampering.tampered || tamperedTxCount > 0,
+        tamperingDetected: tampering.tampered || tamperedTxCount > 0 || balanceTampering.length > 0,
         tamperingDetails: tampering.details,
+        balanceTampering,
         storage: 'local-file',
         filePath: 'data/blockchain.json',
         dbConnection: {
