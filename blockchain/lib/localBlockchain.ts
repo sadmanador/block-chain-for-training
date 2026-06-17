@@ -1,7 +1,11 @@
 import crypto from 'crypto';
 import fs from 'fs/promises';
 import path from 'path';
+import connectDB from './db';
+import BlockchainState from '@/models/BlockchainState';
 
+// Kept for local dev: the file is written as a side-effect so students can inspect it.
+// On Vercel the write silently fails — MongoDB is always the real store.
 const BLOCKCHAIN_FILE = path.join(process.cwd(), 'data', 'blockchain.json');
 
 export interface Block {
@@ -16,15 +20,26 @@ export interface Block {
 class LocalBlockchain {
   private chain: Block[] = [];
   // Legacy fallback field for chains whose genesis block predates the init-entry format.
-  // Stored alongside the chain in blockchain.json.
   private initialBalances: Record<string, number> = {};
 
-  // Always re-read from disk so in-memory state never diverges from the file.
-  // This is intentional: for a file-based teaching blockchain, disk is the truth.
+  // Always re-reads from MongoDB (primary) so in-memory state never diverges from
+  // the persistent store. Falls back to the local file during first-run / migration.
   async init(): Promise<void> {
+    await connectDB();
+
+    const state = await BlockchainState.findOne();
+    if (state) {
+      const parsed = JSON.parse(state.data);
+      this.chain = parsed.chain ?? [];
+      this.initialBalances = parsed.initialBalances ?? {};
+      if (this.chain.length === 0) await this.createGenesisBlock({});
+      return;
+    }
+
+    // No MongoDB record yet — try to migrate from local file
     try {
-      const data = await fs.readFile(BLOCKCHAIN_FILE, 'utf-8');
-      const parsed = JSON.parse(data);
+      const raw = await fs.readFile(BLOCKCHAIN_FILE, 'utf-8');
+      const parsed = JSON.parse(raw);
       if (Array.isArray(parsed)) {
         this.chain = parsed;
         this.initialBalances = {};
@@ -34,18 +49,20 @@ class LocalBlockchain {
       }
       if (this.chain.length === 0) {
         await this.createGenesisBlock({});
+      } else {
+        // Persist migrated data to MongoDB
+        await this.saveChain();
+        console.log('[LocalBlockchain] Migrated from file to MongoDB');
       }
     } catch {
-      // File missing or corrupt — start fresh
-      if (this.chain.length === 0) {
-        await this.createGenesisBlock({});
-      }
+      // File missing — fresh start
+      await this.createGenesisBlock({});
     }
   }
 
-  // initBalances entries are embedded into the genesis block as
-  // {type:"init", user, balance} records so they are covered by the SHA-256 hash.
-  // Any attempt to change who started with what breaks the chain.
+  // initBalances entries are embedded in the genesis block as {type:"init", user, balance}
+  // records so they are covered by the SHA-256 hash. Any tampering with starting balances
+  // breaks the chain.
   private async createGenesisBlock(initBalances: Record<string, number>): Promise<void> {
     const initTxs = Object.entries(initBalances).map(([user, balance]) => ({
       type: 'init',
@@ -103,9 +120,7 @@ class LocalBlockchain {
   async validateChain(): Promise<{ valid: boolean; tamperedBlock?: number; message: string }> {
     await this.init();
 
-    if (this.chain.length === 0) {
-      return { valid: false, message: 'Blockchain is empty' };
-    }
+    if (this.chain.length === 0) return { valid: false, message: 'Blockchain is empty' };
 
     if (this.chain[0].index !== 0 || this.chain[0].previousHash !== '0') {
       return { valid: false, tamperedBlock: 0, message: 'Genesis block is invalid' };
@@ -124,26 +139,25 @@ class LocalBlockchain {
     }
 
     for (let i = 1; i < this.chain.length; i++) {
-      const currentBlock = this.chain[i];
-      const previousBlock = this.chain[i - 1];
+      const cur = this.chain[i];
+      const prev = this.chain[i - 1];
 
-      if (currentBlock.index !== previousBlock.index + 1) {
+      if (cur.index !== prev.index + 1) {
         return { valid: false, tamperedBlock: i, message: `Block ${i} has invalid index` };
       }
-
-      if (currentBlock.previousHash !== previousBlock.hash) {
+      if (cur.previousHash !== prev.hash) {
         return { valid: false, tamperedBlock: i, message: `Block ${i} has invalid previous hash link` };
       }
 
-      const calculatedHash = this.calculateHash({
-        index: currentBlock.index,
-        timestamp: currentBlock.timestamp,
-        transactions: currentBlock.transactions,
-        previousHash: currentBlock.previousHash,
-        nonce: currentBlock.nonce,
+      const calcHash = this.calculateHash({
+        index: cur.index,
+        timestamp: cur.timestamp,
+        transactions: cur.transactions,
+        previousHash: cur.previousHash,
+        nonce: cur.nonce,
       });
 
-      if (calculatedHash !== currentBlock.hash) {
+      if (calcHash !== cur.hash) {
         return { valid: false, tamperedBlock: i, message: `Block ${i} hash mismatch - data may have been tampered` };
       }
     }
@@ -173,7 +187,7 @@ class LocalBlockchain {
 
     for (let i = 0; i < this.chain.length; i++) {
       const block = this.chain[i];
-      const calculatedHash = this.calculateHash({
+      const calcHash = this.calculateHash({
         index: block.index,
         timestamp: block.timestamp,
         transactions: block.transactions,
@@ -181,7 +195,7 @@ class LocalBlockchain {
         nonce: block.nonce,
       });
 
-      if (calculatedHash !== block.hash) {
+      if (calcHash !== block.hash) {
         details.push(`Block ${i}: Hash mismatch detected!`);
         try {
           const txs = JSON.parse(block.transactions);
@@ -191,11 +205,8 @@ class LocalBlockchain {
         }
       }
 
-      if (i > 0) {
-        const prevBlock = this.chain[i - 1];
-        if (block.previousHash !== prevBlock.hash) {
-          details.push(`Block ${i}: Broken chain link with Block ${i - 1}`);
-        }
+      if (i > 0 && block.previousHash !== this.chain[i - 1].hash) {
+        details.push(`Block ${i}: Broken chain link with Block ${i - 1}`);
       }
     }
 
@@ -205,28 +216,23 @@ class LocalBlockchain {
   // Compute what every user's balance should be, derived purely from the blockchain.
   // Source priority:
   //   1. {type:"init"} entries in the genesis block (hash-protected — new chains)
-  //   2. The initialBalances field in blockchain.json (legacy fallback — old chains)
+  //   2. The initialBalances field in the JSON (legacy fallback — old chains)
   async computeExpectedBalances(): Promise<Record<string, number>> {
     await this.init();
 
     let balances: Record<string, number> = {};
 
-    // Read initial balances from genesis init entries
     if (this.chain.length > 0) {
       const genesisTxs: any[] = JSON.parse(this.chain[0].transactions);
       for (const tx of genesisTxs) {
-        if (tx.type === 'init') {
-          balances[tx.user] = tx.balance;
-        }
+        if (tx.type === 'init') balances[tx.user] = tx.balance;
       }
     }
 
-    // Fall back to the file-level field for pre-existing chains
     if (Object.keys(balances).length === 0) {
       balances = { ...this.initialBalances };
     }
 
-    // Apply every regular (non-init) transaction
     for (const block of this.chain) {
       const txs: any[] = JSON.parse(block.transactions);
       for (const tx of txs) {
@@ -253,16 +259,39 @@ class LocalBlockchain {
     return { ...this.initialBalances };
   }
 
+  // Returns the blockchain as formatted JSON — used by the admin raw-file viewer.
+  // On Vercel the local file may not exist; we return the in-memory state instead.
   async getRawFile(): Promise<string> {
-    return fs.readFile(BLOCKCHAIN_FILE, 'utf-8');
+    await this.init();
+    return JSON.stringify(
+      { chain: this.chain, initialBalances: this.initialBalances },
+      null,
+      2
+    );
   }
 
   private async saveChain(): Promise<void> {
-    await fs.mkdir(path.dirname(BLOCKCHAIN_FILE), { recursive: true });
-    await fs.writeFile(
-      BLOCKCHAIN_FILE,
-      JSON.stringify({ chain: this.chain, initialBalances: this.initialBalances }, null, 2)
+    await connectDB();
+
+    const payload = JSON.stringify({ chain: this.chain, initialBalances: this.initialBalances });
+
+    // Primary store: MongoDB (works everywhere including Vercel)
+    await BlockchainState.findOneAndUpdate(
+      {},
+      { data: payload, updatedAt: new Date() },
+      { upsert: true, new: true }
     );
+
+    // Secondary store: local file (best-effort, silently ignored on Vercel)
+    try {
+      await fs.mkdir(path.dirname(BLOCKCHAIN_FILE), { recursive: true });
+      await fs.writeFile(
+        BLOCKCHAIN_FILE,
+        JSON.stringify({ chain: this.chain, initialBalances: this.initialBalances }, null, 2)
+      );
+    } catch {
+      // Read-only filesystem (Vercel) — MongoDB record is the source of truth
+    }
   }
 
   async simulateTampering(blockIndex: number, newAmount: number): Promise<void> {
@@ -284,11 +313,16 @@ class LocalBlockchain {
   async resetChain(initBalances: Record<string, number> = {}): Promise<void> {
     this.chain = [];
     this.initialBalances = {};
+
+    await connectDB();
+    await BlockchainState.deleteMany({});
+
     try {
       await fs.unlink(BLOCKCHAIN_FILE);
     } catch {
       // File might not exist
     }
+
     await this.createGenesisBlock(initBalances);
   }
 }
